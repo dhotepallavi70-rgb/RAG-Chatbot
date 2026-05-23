@@ -1,9 +1,13 @@
 import os
 import time
+import fitz
+import pytesseract
 import streamlit as st
+from PIL import Image
+from io import BytesIO
 from dotenv import load_dotenv
 
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -17,6 +21,9 @@ VECTOR_FOLDER = "vectorstore"
 
 os.makedirs(PDF_FOLDER, exist_ok=True)
 os.makedirs(VECTOR_FOLDER, exist_ok=True)
+
+# For Windows local system, uncomment this if OCR does not work:
+# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 st.set_page_config(
     page_title="DocuMind AI",
@@ -166,7 +173,14 @@ def get_embeddings():
 
 @st.cache_resource
 def get_llm():
+    groq_api_key = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", None)
+
+    if not groq_api_key:
+        st.error("GROQ_API_KEY is missing. Add it in .env locally or Streamlit Secrets online.")
+        st.stop()
+
     return ChatGroq(
+        groq_api_key=groq_api_key,
         model="llama-3.1-8b-instant",
         temperature=0,
         max_tokens=450
@@ -180,29 +194,59 @@ def save_uploaded_files(uploaded_files):
             f.write(uploaded_file.getbuffer())
 
 
-def load_pdf_documents():
+def extract_text_with_ocr(page):
+    pix = page.get_pixmap(dpi=200)
+    image_bytes = pix.tobytes("png")
+    image = Image.open(BytesIO(image_bytes))
+
+    ocr_text = pytesseract.image_to_string(image)
+    return ocr_text.strip()
+
+
+def load_pdf_documents_with_ocr():
     documents = []
+    ocr_pages_count = 0
+    normal_pages_count = 0
 
     for file_name in os.listdir(PDF_FOLDER):
         if file_name.lower().endswith(".pdf"):
             file_path = os.path.join(PDF_FOLDER, file_name)
-            loader = PyPDFLoader(file_path)
-            pages = loader.load()
+            pdf = fitz.open(file_path)
 
-            for page in pages:
-                page.metadata["source"] = file_name
-                page.metadata["page"] = page.metadata.get("page", 0) + 1
+            for page_index, page in enumerate(pdf):
+                page_number = page_index + 1
 
-            documents.extend(pages)
+                text = page.get_text("text").strip()
 
-    return documents
+                if len(text) < 50:
+                    text = extract_text_with_ocr(page)
+                    ocr_pages_count += 1
+                    extraction_type = "OCR"
+                else:
+                    normal_pages_count += 1
+                    extraction_type = "Native Text"
+
+                if text:
+                    doc = Document(
+                        page_content=text,
+                        metadata={
+                            "source": file_name,
+                            "page": page_number,
+                            "extraction_type": extraction_type
+                        }
+                    )
+                    documents.append(doc)
+
+            pdf.close()
+
+    return documents, normal_pages_count, ocr_pages_count
 
 
 def create_vector_database():
-    documents = load_pdf_documents()
+    documents, normal_pages, ocr_pages = load_pdf_documents_with_ocr()
 
     if not documents:
-        return 0, 0, 0
+        return 0, 0, 0, 0, 0
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=850,
@@ -214,11 +258,11 @@ def create_vector_database():
     db = FAISS.from_documents(chunks, get_embeddings())
     db.save_local(VECTOR_FOLDER)
 
-    total_pdfs = len([f for f in os.listdir(PDF_FOLDER) if f.endswith(".pdf")])
-    total_pages = len(documents)
+    total_pdfs = len([f for f in os.listdir(PDF_FOLDER) if f.lower().endswith(".pdf")])
+    total_pages = normal_pages + ocr_pages
     total_chunks = len(chunks)
 
-    return total_pdfs, total_pages, total_chunks
+    return total_pdfs, total_pages, total_chunks, normal_pages, ocr_pages
 
 
 def load_vector_database():
@@ -235,7 +279,8 @@ def build_context(docs):
     for i, doc in enumerate(docs, start=1):
         source = doc.metadata.get("source", "Unknown PDF")
         page = doc.metadata.get("page", "Unknown Page")
-        context += f"\nSource {i}: {source}, Page {page}\n{doc.page_content}\n"
+        extraction_type = doc.metadata.get("extraction_type", "Unknown")
+        context += f"\nSource {i}: {source}, Page {page}, Extraction: {extraction_type}\n{doc.page_content}\n"
 
     return context
 
@@ -285,8 +330,8 @@ def confidence_label(score):
 st.markdown("""
 <div class="hero">
     <h1>📄 DocuMind AI</h1>
-    <p>Production-style Multi-PDF RAG Chatbot powered by Groq, FAISS and Open-source Embeddings.</p>
-    <p><b>Upload PDFs → Ask Questions → Get Answers with Source Page Citations</b></p>
+    <p>Production-style Multi-PDF RAG Chatbot with OCR support for scanned PDFs.</p>
+    <p><b>Upload PDFs → Extract Text/OCR → Ask Questions → Get Source-Cited Answers</b></p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -303,8 +348,8 @@ with col1:
 with col2:
     st.markdown("""
     <div class="metric-card">
-        <h3>📚 Multi-PDF</h3>
-        <p>Search across many documents</p>
+        <h3>📚 Multi-PDF + OCR</h3>
+        <p>Supports normal and scanned PDFs</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -336,22 +381,26 @@ with st.sidebar:
         st.success(f"{len(uploaded_files)} PDF uploaded successfully.")
 
     if st.button("🚀 Process Documents", use_container_width=True):
-        with st.spinner("Creating knowledge base..."):
-            total_pdfs, total_pages, total_chunks = create_vector_database()
+        with st.spinner("Extracting text and applying OCR where required..."):
+            total_pdfs, total_pages, total_chunks, normal_pages, ocr_pages = create_vector_database()
 
         if total_chunks > 0:
             st.success("Knowledge base ready!")
             st.metric("PDFs", total_pdfs)
-            st.metric("Pages", total_pages)
+            st.metric("Total Pages", total_pages)
+            st.metric("Native Text Pages", normal_pages)
+            st.metric("OCR Pages", ocr_pages)
             st.metric("Chunks", total_chunks)
         else:
-            st.error("Please upload PDFs first.")
+            st.error("Please upload readable PDFs first.")
 
     st.divider()
     st.subheader("System Stack")
     st.write("🧠 LLM: Groq Llama")
     st.write("🔎 Vector DB: FAISS")
     st.write("📌 Embeddings: HuggingFace")
+    st.write("📄 PDF Engine: PyMuPDF")
+    st.write("👁 OCR: Tesseract")
     st.write("🎨 UI: Streamlit")
 
 
@@ -416,6 +465,7 @@ if question:
         for doc, score in retrieved_docs_with_scores:
             source = doc.metadata.get("source", "Unknown PDF")
             page = doc.metadata.get("page", "Unknown Page")
+            extraction_type = doc.metadata.get("extraction_type", "Unknown")
             key = f"{source}-{page}"
 
             if key not in shown_sources:
@@ -424,6 +474,7 @@ if question:
                     <div class="source-box">
                         <b>📄 {source}</b><br>
                         Page: <b>{page}</b><br>
+                        Extraction: <b>{extraction_type}</b><br>
                         Confidence: <b>{confidence_label(score)}</b>
                     </div>
                     """,
@@ -439,8 +490,9 @@ if question:
         for i, (doc, score) in enumerate(retrieved_docs_with_scores, start=1):
             source = doc.metadata.get("source", "Unknown PDF")
             page = doc.metadata.get("page", "Unknown Page")
+            extraction_type = doc.metadata.get("extraction_type", "Unknown")
 
-            with st.expander(f"Evidence {i}: {source} — Page {page}"):
+            with st.expander(f"Evidence {i}: {source} — Page {page} — {extraction_type}"):
 
                 st.markdown(
                     f"""
@@ -479,6 +531,6 @@ if question:
 
 st.markdown("""
 <div class="footer">
-    <p>DocuMind AI | Multi-PDF RAG Chatbot | Groq + FAISS + HuggingFace</p>
+    <p>DocuMind AI | Multi-PDF RAG Chatbot | OCR + Groq + FAISS + HuggingFace</p>
 </div>
 """, unsafe_allow_html=True)
